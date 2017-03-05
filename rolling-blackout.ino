@@ -9,40 +9,44 @@
 #define DEBUG 0
 
 // Pin definitions
-// A4, A5 occupied for I2C.
-#define CONTROL_MODE_PIN 0 // Switch: R/C or auto TODO: wire up
-#define RC_STEER_INPUT_PIN 1 // From R/C receiver CH1
-#define RC_THROTTLE_INPUT_PIN 2 // From R/C receiver CH3
-#define LIDAR_ENC_PIN 7 // Lidar encoder ch. A (purple)
-#define LIDAR_REV_PIN 8 // Photointerrupter (gray)
-#define LIDAR_PWM_PIN 9 // Input w/580 ohm pulldown (yellow).
-#define ODO_ENC_PIN_A 11
-#define ODO_ENC_PIN_B 12
-#define LED_PIN 13
-#define STEER_ANGLE_PIN A0
-#define STEER_DIR_PIN 20 // HIGH: right, LOW: left (white)
-#define STEER_PWM_PIN 21 // (gray)
-#define THROTTLE_DIR_PIN 22
-#define THROTTLE_PWM_PIN 23
+// * A4, A5 occupied for I2C.
+// * HW UART for Pololu 24v23 driver (#1383) on Serial1 pins 0,1
+#define THROTTLE_RX_PIN        0
+#define THROTTLE_TX_PIN        1
+#define CONTROL_MODE_PIN       2 // Switch: R/C or auto - not yet wired (TODO)
+#define LIDAR_ENC_PIN          7 // Lidar encoder ch. A (purple)
+#define LIDAR_REV_PIN          8 // Photointerrupter (gray)
+#define LIDAR_PWM_PIN          9 // Input w/580 ohm pulldown (yellow).
+#define ODO_ENC_PIN_A         11
+#define ODO_ENC_PIN_B         12
+#define LED_PIN               13
+#define STEER_ANGLE_PIN       14 // A0
+#define IMU_I2C_SDA           18 // A4
+#define IMU_I2C_SCL           19 // A5
+#define STEER_DIR_PIN         20 // HIGH: right, LOW: left (white)
+#define STEER_PWM_PIN         21 // (gray)
+#define RC_STEER_INPUT_PIN    22 // From R/C receiver CH1
+#define RC_THROTTLE_INPUT_PIN 23 // From R/C receiver CH3
+
 #define RADIO_CONTROL HIGH
 #define AUTONOMOUS LOW
 
 // Global constants
-const int UPDATE_INTERVAL = 20;         // Time between communication updates (ms)
+const int PRINT_INTERVAL = 20;          // Time between comm updates (ms)
 const int LIDAR_PERIOD = 1346;          // Encoder pulses per rotation
 const int ADC_FULL_LEFT  = 430;         // ADC reading at left steer angle limit
 const int ADC_FULL_RIGHT = 830;         // and at right limit
 const float DEG_FULL_LEFT  = -27.0;     // Angle in degrees at left and right
 const float DEG_FULL_RIGHT =  27.0;     // limits
 const float METERS_PER_TICK = 1.07/700; // Wheel circumference/(ticks per rev)
-const float STEER_PID_DEADBAND = 0.20;  // Suppress low-effort motor "struggle"
+const float STEER_PID_DEADBAND = 0.25;  // Suppress low-effort motor "struggle"
+unsigned long STEER_PID_INTERVAL = 10;  // ms
 
 // PID parameters
 // Notes: 1, 0.001, 0 causes large slow oscillations that damp out over ~5sec
 // Notes: 1, 0.0001, 0 drifts slowly to target
 // Notes: 1, 0.0005, 100 - still big oscillations
-float kp = 1, ki = 0.0002, kd = 100;
-unsigned long pidTimeStep = 20; // ms
+float kp = 2, ki = 0.0002, kd = 100;
 
 // Center steering position in "PID units" (i.e. scaled to the [-1,1] interval)
 float initialSteerSetpoint = 0;
@@ -66,13 +70,14 @@ float degreesToPidUnits(float angle)
 
 Encoder odometer(ODO_ENC_PIN_A, ODO_ENC_PIN_B);
 
-PIDControl steerPid(kp, ki, kd, initialSteerSetpoint, pidTimeStep);
+PIDControl steerPid(kp, ki, kd, initialSteerSetpoint, STEER_PID_INTERVAL);
 
 // Bosch BNO055 absolute orientation sensor
 NAxisMotion imu;
 
-// Timer for update interval in ms
+// Timer for update intervals in ms
 elapsedMillis printTimer = 0;
+elapsedMillis steerPidTimer = 0;
 
 // Timer for Lidar signal (PWM pulse width measurement)
 elapsedMicros lidarTimer = 0;
@@ -134,8 +139,6 @@ void setup()
   pinMode(RC_THROTTLE_INPUT_PIN, INPUT);
   pinMode(STEER_DIR_PIN, OUTPUT);
   pinMode(STEER_PWM_PIN, OUTPUT);
-  pinMode(THROTTLE_DIR_PIN, OUTPUT);
-  pinMode(THROTTLE_PWM_PIN, OUTPUT);
   pinMode(LIDAR_ENC_PIN, INPUT);
   pinMode(LIDAR_REV_PIN, INPUT);
   pinMode(LIDAR_PWM_PIN, INPUT);
@@ -274,11 +277,38 @@ void handleByte(byte b)
 
 void loop()
 {
-  // Send out vehicle state every UPDATE_INTERVAL milliseconds
-  // "t:%d,AMGS:%d%d%d%d,qw:%d,qx:%d,qy:%d,qz:%d,sa:%d,odo:%d,r:%d,b:%d\r\n"
-  if (printTimer >= UPDATE_INTERVAL)
+
+  if (steerPidTimer >= STEER_PID_INTERVAL)
   {
-    printTimer -= UPDATE_INTERVAL;
+    steerPidTimer -= STEER_PID_INTERVAL;
+
+    // Copy volatile data over to stable variables. Use only the latter for calculations.
+    noInterrupts();
+    rcSteerValue = rcSteerPulseWidth;
+    rcThrottleValue = rcThrottlePulseWidth; // NOTE: may eventually move to throttle PID loop
+    interrupts();
+
+    if (digitalRead(CONTROL_MODE_PIN) == RADIO_CONTROL)
+    {
+      steerPid.setpoint = (float(rcSteerValue) - 1500.)/500;
+    }
+
+    steerPid.update(adcToPidUnits(adc16 >> 4), millis());
+
+    // Temp - dev
+    Serial.print(steerPid.setpoint);
+    Serial.print(",");
+    Serial.println(adcToPidUnits(adc16 >> 4));
+
+    updateSteering(steerPid.output);
+  }
+
+
+  // Send out vehicle state every PRINT_INTERVAL milliseconds
+  // "t:%d,AMGS:%d%d%d%d,qw:%d,qx:%d,qy:%d,qz:%d,sa:%d,odo:%d,r:%d,b:%d\r\n"
+  if (printTimer >= PRINT_INTERVAL)
+  {
+    printTimer -= PRINT_INTERVAL;
 
     odometerDistance = METERS_PER_TICK*odometer.read();
 
@@ -292,26 +322,6 @@ void loop()
     // Serial.print(odometerDistance);
     // printLidar();
     // Serial.println();
-
-    // Copy volatile data over to stable variables. Use only the latter for calculations.
-    noInterrupts();
-    rcSteerValue = rcSteerPulseWidth;
-    rcThrottleValue = rcThrottlePulseWidth;
-    interrupts();
-
-    if (digitalRead(CONTROL_MODE_PIN) == RADIO_CONTROL)
-    {
-      steerPid.setpoint = (float(rcSteerValue) - 1500.)/500;
-    }
-
-    steerPid.update(adcToPidUnits(adc16 >> 4), millis());
-
-    // Temp - dev
-    Serial.print(steerPid.setpoint);
-    Serial.print(",");
-    Serial.println(steerPid.output);
-
-    updateSteering(steerPid.output);
   }
 
   if (Serial.available() > 0)
