@@ -35,10 +35,13 @@ const int ADC_FULL_RIGHT = 830;         // and at right limit
 const float DEG_FULL_LEFT  = -27.0;     // Angle in degrees at left and right
 const float DEG_FULL_RIGHT =  27.0;     // limits
 const float METERS_PER_TICK = 1.07/700; // Wheel circumference/(ticks per rev)
-const float STEER_PID_DEADBAND = 0.01;
+const float STEER_PID_DEADBAND = 0.20;  // Suppress low-effort motor "struggle"
 
 // PID parameters
-float kp = 1, ki = 0, kd = 0;
+// Notes: 1, 0.001, 0 causes large slow oscillations that damp out over ~5sec
+// Notes: 1, 0.0001, 0 drifts slowly to target
+// Notes: 1, 0.0005, 100 - still big oscillations
+float kp = 1, ki = 0.0002, kd = 100;
 unsigned long pidTimeStep = 20; // ms
 
 // Center steering position in "PID units" (i.e. scaled to the [-1,1] interval)
@@ -105,7 +108,9 @@ String cmd = "";
 void updateSteering(float pidOutput)
 {
   // Use |pidOutput| for linear mapping. Sign used below for STEER_DIR_PIN.
-  // TODO: implement STEER_PID_DEADBAND here
+  if (fabs(pidOutput) < STEER_PID_DEADBAND)
+    pidOutput = 0;
+
   int steerMotorPwmVal = map(1e6*fabs(pidOutput), 0, 1e6, 0, 255);
   steerMotorPwmVal = constrain(steerMotorPwmVal, 0, 255);
 
@@ -141,7 +146,7 @@ void setup()
   steerPid.minOutput = -1; // Full speed left
   steerPid.maxOutput = +1; // Full speed right
 
-  // // I2C and IMU sensor initialization
+  // I2C and IMU sensor initialization
   I2C.begin();
   imu.initSensor();
   imu.setOperationMode(OPERATION_MODE_NDOF);
@@ -302,8 +307,8 @@ void loop()
     steerPid.update(adcToPidUnits(adc16 >> 4), millis());
 
     // Temp - dev
-    Serial.println(steerPid.setpoint);
-    Serial.print(' ');
+    Serial.print(steerPid.setpoint);
+    Serial.print(",");
     Serial.println(steerPid.output);
 
     updateSteering(steerPid.output);
