@@ -320,51 +320,6 @@ void printLidar()
   Serial.print(lidarAngle);
 }
 
-void handleByte(byte b)
-{
-  if (b == '-')
-    cmd = "-";
-
-  // kp
-  else if (b == 'p') // increase kp
-    kp += 0.01;
-  else if (b == 'l') // decrease kp
-    kp -= 0.01;
-
-  // ki
-  else if (b == 'i') // increase ki
-    ki += 0.1;
-  else if (b == 'k') // decrease ki
-    ki -= 0.1;
-
-  // kd
-  else if (b == 'd') // increase kd
-    kd += 0.001;
-  else if (b == 'c') // decrease kd
-    kd -= 0.001;
-
-  else if (b == '.')
-    cmd += b;
-  else if (isDigit(b))
-  {
-    byte digit = b - 48;
-    cmd += digit;
-  }
-  else if (b == '\r' || b == '\n')
-  {
-    // *** For prototyping ***
-    // Assume here that cmd is a signed angle setpoint in degrees.
-    // Convert to a value in [-1,1] for PID input
-    float setPoint = degreesToPidUnits(cmd.toFloat());
-    steerPid.setpoint = constrain(setPoint, steerPid.minOutput, steerPid.maxOutput);
-    cmd = "";
-  }
-  else
-  {
-    steerPid.setPID(kp, ki, kd);
-  }
-}
-
 void loop()
 {
   // *****************************************************************************
@@ -456,12 +411,6 @@ void loop()
     // Serial.print(odometerDistance);
     // printLidar();
     // Serial.println();
-  }
-
-  if (Serial.available() > 0)
-  {
-    byte rxByte = Serial.read();
-    handleByte(rxByte);
   }
 
   // Read potentiometer and update steering angle
