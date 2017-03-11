@@ -43,6 +43,7 @@ const float DEG_FULL_RIGHT =  27.0;     // limits
 const float METERS_PER_TICK = 1.07/700; // Wheel circumference/(ticks per rev)
 const float STEER_PID_DEADBAND = 0.25;  // Suppress low-effort motor "struggle"
 unsigned long STEER_PID_INTERVAL = 10;  // ms
+unsigned long THROTTLE_PID_INTERVAL = 25;  // ms
 
 
 // *****************************************************************************
@@ -134,6 +135,7 @@ float degreesToPidUnits(float angle)
 Encoder odometer(ODO_ENC_PIN_A, ODO_ENC_PIN_B);
 
 PIDControl steerPid(kp, ki, kd, initialSteerSetpoint, STEER_PID_INTERVAL);
+float throttleSetpoint = 0;
 
 // Bosch BNO055 absolute orientation sensor
 NAxisMotion imu;
@@ -141,6 +143,7 @@ NAxisMotion imu;
 // Timer for update intervals in ms
 elapsedMillis printTimer = 0;
 elapsedMillis steerPidTimer = 0;
+elapsedMillis throttlePidTimer = 0;
 
 // Timer for Lidar signal (PWM pulse width measurement)
 elapsedMicros lidarTimer = 0;
@@ -213,12 +216,10 @@ void setup()
   steerPid.maxOutput = +1; // Full speed right
 
   // I2C and IMU sensor initialization
-  // *****************************************************************************
-  // I2C.begin();
-  // imu.initSensor();
-  // imu.setOperationMode(OPERATION_MODE_NDOF);
-  // imu.setUpdateMode(MANUAL);
-  // *****************************************************************************
+  I2C.begin();
+  imu.initSensor();
+  imu.setOperationMode(OPERATION_MODE_NDOF);
+  imu.setUpdateMode(MANUAL);
 
   // Attach ISR for pulse width measurement
   attachInterrupt(digitalPinToInterrupt(LIDAR_PWM_PIN), onLidarPinChange, CHANGE);
@@ -235,7 +236,7 @@ void setup()
 
 
   // *****************************************************************************
-  Serial1.begin(38400); // HW serial on pins 0,1
+  Serial1.begin(38400); // UART to motor driver on pins 0,1
 
   // Briefly reset SMC when MCU starts up (optional)
   pinMode(THROTTLE_RST_PIN, OUTPUT);
@@ -367,16 +368,16 @@ void handleByte(byte b)
 void loop()
 {
   // *****************************************************************************
-  setMotorSpeed(3200);  // full-speed forward
-  Serial.println((int16_t)getValue(TARGET_SPEED_ADDR)); // cast signed vals
-  delay(1000);
-  setMotorSpeed(-3200);  // full-speed reverse
-  Serial.println((int16_t)getValue(TARGET_SPEED_ADDR));
-  delay(1000);
+  // setMotorSpeed(3200);  // full-speed forward
+  // Serial.println((int16_t)getValue(TARGET_SPEED_ADDR)); // cast signed vals
+  // delay(1000);
+  // setMotorSpeed(-3200);  // full-speed reverse
+  // Serial.println((int16_t)getValue(TARGET_SPEED_ADDR));
+  // delay(1000);
 
   // write input voltage (in millivolts) to the serial monitor
-  Serial.print("VIN = ");
-  Serial.println(getValue(INPUT_VOLTAGE_ADDR)); // mV
+  // Serial.print("VIN = ");
+  // Serial.println(getValue(INPUT_VOLTAGE_ADDR)); // mV
 
   // if an error is stopping the motor, write the error status variable
   // and try to re-enable the motor
@@ -390,6 +391,7 @@ void loop()
   }
   // *****************************************************************************
 
+  // Steering control
   if (steerPidTimer >= STEER_PID_INTERVAL)
   {
     steerPidTimer -= STEER_PID_INTERVAL;
@@ -397,13 +399,13 @@ void loop()
     // Copy volatile data over to stable variables. Use only the latter for calculations.
     noInterrupts();
     rcSteerValue = rcSteerPulseWidth;
-    rcThrottleValue = rcThrottlePulseWidth; // NOTE: may eventually move to throttle PID loop
     interrupts();
 
     if (digitalRead(CONTROL_MODE_PIN) == RADIO_CONTROL)
     {
       steerPid.setpoint = (float(rcSteerValue) - 1500.)/500;
     }
+    // else: from autonomously computed signal (WIP)
 
     steerPid.update(adcToPidUnits(adc16 >> 4), millis());
 
@@ -415,6 +417,26 @@ void loop()
     updateSteering(steerPid.output);
   }
 
+  // Throttle control
+  if (throttlePidTimer >= THROTTLE_PID_INTERVAL)
+  {
+    throttlePidTimer -= THROTTLE_PID_INTERVAL;
+
+    noInterrupts();
+    rcThrottleValue = rcThrottlePulseWidth;
+    interrupts();
+
+    if (digitalRead(CONTROL_MODE_PIN) == RADIO_CONTROL)
+    {
+      throttleSetpoint = (float(rcThrottleValue) - 1500.)/500;
+    }
+    // else: from autonomously computed signal (WIP)
+
+    // Deadband
+    if (fabs(throttleSetpoint) < 0.1) throttleSetpoint = 0;
+
+    setMotorSpeed((int)(3200*throttleSetpoint));
+  }
 
   // Send out vehicle state every PRINT_INTERVAL milliseconds
   // "t:%d,AMGS:%d%d%d%d,qw:%d,qx:%d,qy:%d,qz:%d,sa:%d,odo:%d,r:%d,b:%d\r\n"
