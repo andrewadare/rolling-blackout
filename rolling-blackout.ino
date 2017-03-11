@@ -7,13 +7,18 @@
 #include <Wire.h>
 
 #define DEBUG 0
+#define RADIO_CONTROL HIGH
+#define AUTONOMOUS LOW
 
 // Pin definitions
 // * A4, A5 occupied for I2C.
 // * HW UART for Pololu 24v23 driver (#1383) on Serial1 pins 0,1
 #define THROTTLE_RX_PIN        0
 #define THROTTLE_TX_PIN        1
-#define CONTROL_MODE_PIN       2 // Switch: R/C or auto - not yet wired (TODO)
+#define THROTTLE_ERR_PIN       2
+#define THROTTLE_RST_PIN       3
+#define CONTROL_MODE_PIN       4 // Switch: R/C or auto - not yet wired (TODO)
+
 #define LIDAR_ENC_PIN          7 // Lidar encoder ch. A (purple)
 #define LIDAR_REV_PIN          8 // Photointerrupter (gray)
 #define LIDAR_PWM_PIN          9 // Input w/580 ohm pulldown (yellow).
@@ -28,9 +33,6 @@
 #define RC_STEER_INPUT_PIN    22 // From R/C receiver CH1
 #define RC_THROTTLE_INPUT_PIN 23 // From R/C receiver CH3
 
-#define RADIO_CONTROL HIGH
-#define AUTONOMOUS LOW
-
 // Global constants
 const int PRINT_INTERVAL = 20;          // Time between comm updates (ms)
 const int LIDAR_PERIOD = 1346;          // Encoder pulses per rotation
@@ -41,6 +43,67 @@ const float DEG_FULL_RIGHT =  27.0;     // limits
 const float METERS_PER_TICK = 1.07/700; // Wheel circumference/(ticks per rev)
 const float STEER_PID_DEADBAND = 0.25;  // Suppress low-effort motor "struggle"
 unsigned long STEER_PID_INTERVAL = 10;  // ms
+
+
+// *****************************************************************************
+#define ERROR_STATUS_ADDR 0
+#define LIMIT_STATUS_ADDR 3
+#define TARGET_SPEED_ADDR 20
+#define INPUT_VOLTAGE_ADDR 23
+#define TEMPERATURE_ADDR 24
+
+// required to allow motors to move
+// must be called when controller restarts and after any error
+void exitSafeStart()
+{
+  Serial1.write(0x83);
+}
+
+// speed should be a number from -3200 to 3200
+void setMotorSpeed(int speed)
+{
+  if (speed < 0)
+  {
+    Serial1.write(0x86);  // motor reverse command
+    speed = -speed;  // make speed positive
+  }
+  else
+  {
+    Serial1.write(0x85);  // motor forward command
+  }
+  Serial1.write(speed & 0x1F);
+  Serial1.write(speed >> 5);
+}
+
+// Read a serial byte
+// Returns -1 if nothing received before timeout
+int readByte()
+{
+  char c;
+  if (Serial1.readBytes(&c, 1) == 0) { return -1; }
+  return (byte)c;
+}
+
+unsigned char setMotorLimit(unsigned char limitID, unsigned int limitValue)
+{
+  Serial1.write(0xA2);
+  Serial1.write(limitID);
+  Serial1.write(limitValue & 0x7F);
+  Serial1.write(limitValue >> 7);
+  return readByte();
+}
+
+// returns the specified variable as an unsigned integer.
+// if the requested variable is signed, the value returned by this function
+// should be typecast as an int.
+unsigned int getValue(unsigned char variableID)
+{
+  Serial1.write(0xA1);
+  Serial1.write(variableID);
+  return readByte() + 256 * readByte();
+}
+// *****************************************************************************
+
 
 // PID parameters
 // Notes: 1, 0.001, 0 causes large slow oscillations that damp out over ~5sec
@@ -150,10 +213,12 @@ void setup()
   steerPid.maxOutput = +1; // Full speed right
 
   // I2C and IMU sensor initialization
-  I2C.begin();
-  imu.initSensor();
-  imu.setOperationMode(OPERATION_MODE_NDOF);
-  imu.setUpdateMode(MANUAL);
+  // *****************************************************************************
+  // I2C.begin();
+  // imu.initSensor();
+  // imu.setOperationMode(OPERATION_MODE_NDOF);
+  // imu.setUpdateMode(MANUAL);
+  // *****************************************************************************
 
   // Attach ISR for pulse width measurement
   attachInterrupt(digitalPinToInterrupt(LIDAR_PWM_PIN), onLidarPinChange, CHANGE);
@@ -167,6 +232,30 @@ void setup()
   attachInterrupt(digitalPinToInterrupt(RC_THROTTLE_INPUT_PIN), onRcThrottlePinChange, CHANGE);
 
   Serial.begin(115200);
+
+
+  // *****************************************************************************
+  Serial1.begin(38400); // HW serial on pins 0,1
+
+  // Briefly reset SMC when MCU starts up (optional)
+  pinMode(THROTTLE_RST_PIN, OUTPUT);
+  digitalWrite(THROTTLE_RST_PIN, LOW);  // reset SMC
+  delay(1);
+  pinMode(THROTTLE_RST_PIN, INPUT);  // let SMC run again
+  pinMode(THROTTLE_ERR_PIN, INPUT);
+
+  // the Simple Motor Controller must be running for at least 1 ms
+  // before we try to send serial data, so we delay here for 5 ms
+  delay(5);
+
+  // if the Simple Motor Controller has automatic baud detection
+  // enabled, we first need to send it the byte 0xAA (170 in decimal)
+  // so that it can learn the baud rate
+  Serial1.write(0xAA);  // send baud-indicator byte
+  // next we need to send the Exit Safe Start command, which
+  // clears the safe-start violation and lets the motor run
+  exitSafeStart();  // clear the safe-start violation and let the motor run
+  // *****************************************************************************
 
   // Wait for serial port to connect (for dev work)
   while (!Serial) {;}
@@ -277,6 +366,29 @@ void handleByte(byte b)
 
 void loop()
 {
+  // *****************************************************************************
+  setMotorSpeed(3200);  // full-speed forward
+  Serial.println((int16_t)getValue(TARGET_SPEED_ADDR)); // cast signed vals
+  delay(1000);
+  setMotorSpeed(-3200);  // full-speed reverse
+  Serial.println((int16_t)getValue(TARGET_SPEED_ADDR));
+  delay(1000);
+
+  // write input voltage (in millivolts) to the serial monitor
+  Serial.print("VIN = ");
+  Serial.println(getValue(INPUT_VOLTAGE_ADDR)); // mV
+
+  // if an error is stopping the motor, write the error status variable
+  // and try to re-enable the motor
+  if (digitalRead(THROTTLE_ERR_PIN) == HIGH)
+  {
+    Serial.print("Error Status: 0x");
+    Serial.println(getValue(ERROR_STATUS_ADDR), HEX);
+    // once all other errors have been fixed,
+    // this lets the motors run again
+    exitSafeStart();
+  }
+  // *****************************************************************************
 
   if (steerPidTimer >= STEER_PID_INTERVAL)
   {
