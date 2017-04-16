@@ -47,11 +47,78 @@ unsigned long THROTTLE_PID_INTERVAL = 25;  // ms
 
 
 // *****************************************************************************
-#define ERROR_STATUS_ADDR 0
-#define LIMIT_STATUS_ADDR 3
-#define TARGET_SPEED_ADDR 20
-#define INPUT_VOLTAGE_ADDR 23
-#define TEMPERATURE_ADDR 24
+// The set bits of the value read from this variable indicate the errors that
+// are currently stopping the motor. The motor can only be driven when this
+// register has a value of 0.
+// - Bit 0: Safe Start Violation
+// - Bit 1: Required Channel Invalid
+// - Bit 2: Serial Error
+// - Bit 3: Command Timeout
+// - Bit 4: Limit/Kill Switch
+// - Bit 5: Low VIN
+// - Bit 6: High VIN
+// - Bit 7: Over Temperature
+// - Bit 8: Motor Driver Error
+// - Bit 9: ERR Line High
+// - Bits 10-15: reserved
+#define ERROR_STATUS_ID 0
+
+char* errorStatusMessage[] = {
+  "safe start violation",
+  "required channel invalid",
+  "serial error",
+  "command timeout",
+  "limit/kill switch",
+  "low VIN",
+  "high VIN",
+  "over temperature",
+  "motor driver error",
+  "ERR line high"
+};
+
+// The set bits of this variable indicate things that are currently limiting the motor controller.
+// - Bit 0: Motor is not allowed to run due to an error or safe-start violation.
+// - Bit 1: Temperature is active reducing target speed.
+// - Bit 2: Max speed limit is actively reducing target speed (target speed > max speed).
+// - Bit 3: Starting speed limit is actively reducing target speed to zero (target speed < starting speed).
+// - Bit 4: Motor speed is not equal to target speed because of acceleration, deceleration, or brake duration limits.
+// - Bit 5: RC1 is configured as a limit/kill switch and the switch is active (scaled value ≥ 1600).
+// - Bit 6: RC2 limit/kill switch is active (scaled value ≥ 1600).
+// - Bit 7: AN1 limit/kill switch is active (scaled value ≥ 1600).
+// - Bit 8: AN2 limit/kill switch is active (scaled value ≥ 1600).
+// - Bit 9: USB kill switch is active.
+// - Bits 10-15: reserved
+#define LIMIT_STATUS_ID 3
+
+char* limitStatusMessage[] = {
+  "safe start violation",
+  "temperature limit",
+  "target > max speed",
+  "target < start speed",
+  "acc/dec/brake limits",
+  "RC1 limit/kill",
+  "RC2 limit/kill",
+  "AN1 limit/kill",
+  "AN2 limit/kill",
+  "USB limit/kill"
+};
+
+#define TARGET_SPEED_ID   20  // int16 (-3200 to +3200) - Motor target speed
+#define MOTOR_SPEED_ID    21  // int16 (-3200 to +3200) - Current motor speed
+#define BRAKE_AMOUNT_ID   22  // uint16 (0-32) - 0 = full coast; 32 = full brake; 255 if speed=0.
+#define INPUT_VOLTAGE_ID  23  // uint16 - Voltage on VIN in mV
+#define TEMPERATURE_ID    24  // uint16 - Board temp. in units of 0.1 deg C
+#define RC_PERIOD_ID      26  // uint16 - If there is a valid signal on RC1, this variable contains the signal period. Otherwise, this variable has a value of 0. (0.1 ms)
+#define BAUD_RATE_ID      27  // uint16 - Value of the controller’s baud rate register (BRR). Convert to units of bps with the equation 72,000,000/BRR. In automatic baud detection mode, BRR has a value of 0 until the controller has detected the baud rate. seconds per 7.2e7 bits
+#define SYS_TIME_LOW_ID   28  // uint16 - Two lower bytes of the number of milliseconds that have elapsed since the controller was last reset or powered up. ms
+#define SYS_TIME_HIGH_ID  29  // uint16 - Two upper bytes of the number of milliseconds that have elapsed since the controller was last reset or powered up. 65,536 ms
+
+// Variable IDs for motor limits. If IDs 0-3 are used, the limit is
+// applied to both fwd and rev directions. If IDs > 3 are used, the limit is
+// applied only to the specified direction.
+#define SPEED_LIMIT_ID 0 // valid limitValue: 0-3200 for 0-100%
+#define ACCEL_LIMIT_ID 1 // valid limitValue: 0-3200 (0 = no limit)
+#define DECEL_LIMIT_ID 2 // valid limitValue: 0-3200 (0 = no limit)
 
 // required to allow motors to move
 // must be called when controller restarts and after any error
@@ -76,32 +143,29 @@ void setMotorSpeed(int speed)
   Serial1.write(speed >> 5);
 }
 
-// Read a serial byte
-// Returns -1 if nothing received before timeout
-int readByte()
-{
-  char c;
-  if (Serial1.readBytes(&c, 1) == 0) { return -1; }
-  return (byte)c;
-}
-
-unsigned char setMotorLimit(unsigned char limitID, unsigned int limitValue)
+uint8_t setMotorLimit(unsigned char limitID, uint16_t limitValue)
 {
   Serial1.write(0xA2);
   Serial1.write(limitID);
   Serial1.write(limitValue & 0x7F);
   Serial1.write(limitValue >> 7);
-  return readByte();
+  return Serial1.read();
 }
 
 // returns the specified variable as an unsigned integer.
 // if the requested variable is signed, the value returned by this function
 // should be typecast as an int.
-unsigned int getValue(unsigned char variableID)
+int getValue(unsigned char variableID)
 {
   Serial1.write(0xA1);
   Serial1.write(variableID);
-  return readByte() + 256 * readByte();
+
+  // These might return -1 in case of a timeout
+  int lowByte = Serial1.read();
+  int highByte = Serial1.read();
+  if (lowByte == -1 || highByte == -1)
+    return -1;
+  return lowByte + 256*highByte;
 }
 // *****************************************************************************
 
@@ -256,6 +320,23 @@ void setup()
   // next we need to send the Exit Safe Start command, which
   // clears the safe-start violation and lets the motor run
   exitSafeStart();  // clear the safe-start violation and let the motor run
+
+  // Set all limits to maximum
+  setMotorLimit(SPEED_LIMIT_ID, 3200);
+  setMotorLimit(ACCEL_LIMIT_ID, 3200);
+  setMotorLimit(DECEL_LIMIT_ID, 3200);
+
+  Serial.print("Speed limit: ");
+  Serial.println(getValue(SPEED_LIMIT_ID));
+  Serial.print("Accel limit: ");
+  Serial.println(getValue(ACCEL_LIMIT_ID));
+  Serial.print("Decel limit: ");
+  Serial.println(getValue(DECEL_LIMIT_ID));
+
+  Serial.print("VIN = ");
+  Serial.print(getValue(INPUT_VOLTAGE_ID));
+  Serial.println(" mV");
+  delay(3000);
   // *****************************************************************************
 
   // Wait for serial port to connect (for dev work)
@@ -324,22 +405,36 @@ void loop()
 {
   // *****************************************************************************
   // setMotorSpeed(3200);  // full-speed forward
-  // Serial.println((int16_t)getValue(TARGET_SPEED_ADDR)); // cast signed vals
+  // Serial.println((int16_t)getValue(TARGET_SPEED_ID)); // cast signed vals
   // delay(1000);
   // setMotorSpeed(-3200);  // full-speed reverse
-  // Serial.println((int16_t)getValue(TARGET_SPEED_ADDR));
+  // Serial.println((int16_t)getValue(TARGET_SPEED_ID));
   // delay(1000);
 
   // write input voltage (in millivolts) to the serial monitor
   // Serial.print("VIN = ");
-  // Serial.println(getValue(INPUT_VOLTAGE_ADDR)); // mV
+  // Serial.println(getValue(INPUT_VOLTAGE_ID)); // mV
 
   // if an error is stopping the motor, write the error status variable
   // and try to re-enable the motor
   if (digitalRead(THROTTLE_ERR_PIN) == HIGH)
   {
-    Serial.print("Error Status: 0x");
-    Serial.println(getValue(ERROR_STATUS_ADDR), HEX);
+    uint16_t errStatus = (uint16_t)getValue(ERROR_STATUS_ID);
+    uint16_t limStatus = (uint16_t)getValue(LIMIT_STATUS_ID);
+    Serial.print("Error: 0x");
+    Serial.println(errStatus, HEX);
+    Serial.print("Limit: 0x");
+    Serial.println(limStatus, HEX);
+    for (uint16_t i=0; i<10; ++i)
+    {
+      if (errStatus & i)
+        Serial.println(errorStatusMessage[i]);
+      if (limStatus & i)
+        Serial.println(limitStatusMessage[i]);
+    }
+    Serial.print("VIN = ");
+    Serial.println(getValue(INPUT_VOLTAGE_ID)); // mV
+
     // once all other errors have been fixed,
     // this lets the motors run again
     exitSafeStart();
@@ -365,9 +460,9 @@ void loop()
     steerPid.update(adcToPidUnits(adc16 >> 4), millis());
 
     // Temp - dev
-    Serial.print(steerPid.setpoint);
-    Serial.print(",");
-    Serial.println(adcToPidUnits(adc16 >> 4));
+    // Serial.print(steerPid.setpoint);
+    // Serial.print(",");
+    // Serial.println(adcToPidUnits(adc16 >> 4));
 
     updateSteering(steerPid.output);
   }
